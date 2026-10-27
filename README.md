@@ -10,7 +10,7 @@ This is an educational prototype trained on synthetic data. It is not production
 | Phase | Scope | State |
 |---|---|---|
 | 1 | Inspect the dataset | **Done**: `src/training/inspect_data.py` |
-| 2 | Baseline XGBoost model | **Done**: `src/training/train.py` (still needs a run on the real PaySim CSV) |
+| 2 | Baseline XGBoost model | **Done**: `src/training/train.py`, results below |
 | 3 | Kafka producer / topics | Not started |
 | 4 | Spark streaming inference | Not started |
 | 5 | PostgreSQL, FastAPI, Redis | Not started |
@@ -83,10 +83,66 @@ test split. Test metrics are reported at both 0.5 and the chosen threshold.
 **Metrics recorded:** PR-AUC, ROC-AUC, precision, recall, F1, false-positive rate, confusion
 matrix, batch and single-event inference latency.
 
-### Results
+### Data quality report (Phase 1)
 
-_Not yet recorded._ Paste the output of `python -m src.training.train` on the full PaySim
-file here. Don't copy numbers from elsewhere.
+Run on the Kaggle file `PS_20174392719_1491204439457_log.csv` (493.5 MB).
+
+| Check | Result |
+|---|---|
+| Rows x columns | 6,362,620 x 11; all required columns present |
+| Missing values / duplicate rows | 0 / 0 |
+| Fraud | 8,213 rows (0.1291%), about 1 in 775 |
+| `isFlaggedFraud` | 16 rows: the built-in rule catches almost none of the fraud |
+| Time range | `step` 1-743 (about 31 days of hourly steps) |
+
+| Type | Transactions | Fraud | Fraud rate |
+|---|---:|---:|---:|
+| CASH_IN | 1,399,284 | 0 | 0.0000% |
+| CASH_OUT | 2,237,500 | 4,116 | 0.1840% |
+| DEBIT | 41,432 | 0 | 0.0000% |
+| PAYMENT | 2,151,495 | 0 | 0.0000% |
+| TRANSFER | 532,909 | 4,097 | 0.7688% |
+
+Fraud occurs only in `TRANSFER` and `CASH_OUT`, matching PaySim's "transfer out, then cash
+out" pattern. Predicting "not fraud" for everything would score 99.87% accuracy, which is why
+accuracy is not reported.
+
+### Baseline results (Phase 2)
+
+Full dataset, model `v20261027110747`, trained on a Windows laptop.
+
+| Split | Steps | Rows | Fraud | Fraud rate |
+|---|---|---:|---:|---:|
+| Train | 1-323 | 4,463,587 | 3,643 | 0.082% |
+| Validation | 324-378 | 980,416 | 564 | 0.058% |
+| Test | 379-743 | 918,617 | 4,006 | 0.436% |
+
+Test set: **PR-AUC 0.9999**, ROC-AUC 1.0000.
+
+| Threshold | Precision | Recall | F1 | FPR | TN | FP | FN | TP |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| 0.5 (default) | 0.9993 | 0.9995 | 0.9994 | 0.000003 | 914,608 | 3 | 2 | 4,004 |
+| 0.9989 (max F1 on validation) | 1.0000 | 0.9950 | 0.9975 | 0.000000 | 914,611 | 0 | 20 | 3,986 |
+
+Inference: 1.98 ms per 1,000 rows in a batch, 5.66 ms median for a single event.
+
+**How to read these numbers**
+
+- **They are a property of the simulator, not proof of a great model.** In PaySim, fraud almost
+  always empties the origin account (`oldbalanceOrg == amount`, `newbalanceOrig == 0`), so the
+  balance features nearly give the answer away. Real fraud is not this clean.
+- **Possible temporal leakage.** `newbalanceOrig` and `newbalanceDest` are post-transaction
+  balances. A real scoring system may not know them before the payment is authorised. A
+  comparison model without them is the next experiment.
+- **The base rate shifts over time.** Legitimate volume falls off in later steps while fraud
+  stays roughly constant, so the test split's fraud rate (0.436%) is about 5x the training rate.
+  A chronological split exposes this; a random split would hide it.
+- **The validation-chosen threshold was too strict for the test period.** It removed the 3 false
+  positives but missed 18 more frauds. The validation window had only 564 fraud cases and a
+  lower base rate, so the threshold did not transfer cleanly.
+- **Latency:** per-row cost is tiny in batches, but a single event pays about 5.7 ms of
+  pandas/sklearn overhead. The streaming path should score Spark micro-batches, not individual
+  rows.
 
 ## Tests
 
