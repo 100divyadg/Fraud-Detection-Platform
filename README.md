@@ -11,7 +11,7 @@ This is an educational prototype trained on synthetic data. It is not production
 |---|---|---|
 | 1 | Inspect the dataset | **Done**: `src/training/inspect_data.py` |
 | 2 | Baseline XGBoost model | **Done**: `full` vs `pre_transaction` comparison below; live pipeline uses `pre_transaction` |
-| 3 | Kafka producer / topics | Not started |
+| 3 | Kafka producer / topics | **Done**: `docker-compose.yml`, `src/streaming/producer.py`, `src/streaming/check_consumer.py` |
 | 4 | Spark streaming inference | Not started |
 | 5 | PostgreSQL, FastAPI, Redis | Not started |
 | 6 | Docker, CI, load tests | Not started |
@@ -210,6 +210,79 @@ payment before it completes. The two thresholds map naturally onto risk levels:
 Consequently the Kafka transaction event (Phase 3) must carry `type`, `amount`,
 `oldbalanceOrg`, `oldbalanceDest` and `step`, and does not need the post-transaction balances.
 
+## Phase 3: stream transactions through Kafka
+
+Needs Docker Desktop. On Windows it needs WSL 2: run `wsl --install` in an administrator
+PowerShell, restart, then install Docker Desktop.
+
+```bash
+docker compose up -d                                   # Kafka + topics + Kafka UI
+python -m src.streaming.producer --limit 5 --dry-run   # print events, no Kafka needed
+python -m src.streaming.producer --limit 1000 --rate 100
+python -m src.streaming.check_consumer                 # read back and validate
+```
+
+Kafka UI is at http://localhost:8080. Stop with `docker compose down`; add `-v` to delete
+the stored messages as well.
+
+**Services** (`docker-compose.yml`):
+
+| Service | Purpose |
+|---|---|
+| `kafka` | Single Kafka 3.9 broker in KRaft mode (no ZooKeeper). Laptop clients use `localhost:9092`; containers use `kafka:29092` |
+| `kafka-init` | Creates the topics once Kafka is healthy, then exits. Auto-creation is off, so a mistyped topic name fails instead of silently creating a new topic |
+| `kafka-ui` | Web UI for browsing topics, partitions and messages |
+
+**Topics:**
+
+| Topic | Partitions | Contents |
+|---|---:|---|
+| `transactions` | 3 | Incoming transaction events |
+| `fraud-alerts` | 1 | High-risk transactions (written in Phase 4) |
+| `transactions-dlq` | 1 | Malformed events routed aside by the processor (Phase 4) |
+
+**Event contract** (`src/common/events.py`, `schema_version` 1):
+
+```json
+{
+  "schema_version": 1,
+  "transaction_id": "TXN-000000002",
+  "event_timestamp": "2026-10-27T16:01:06.676Z",
+  "step": 1,
+  "type": "TRANSFER",
+  "amount": 181.0,
+  "nameOrig": "C1305486145",
+  "oldbalanceOrg": 181.0,
+  "nameDest": "C553264065",
+  "oldbalanceDest": 0.0
+}
+```
+
+- Carries exactly the inputs of the `pre_transaction` model plus identifiers. `isFraud`,
+  `isFlaggedFraud`, `newbalanceOrig` and `newbalanceDest` are forbidden, and
+  `validate_event` rejects an event containing any of them.
+- `transaction_id` is derived from the CSV row number, so replaying the same rows re-sends the
+  same IDs. This lets later phases test idempotent writes.
+- `event_timestamp` is the producer's clock at send time (UTC). PaySim's `step` is simulated
+  hours, not a real timestamp.
+- Messages are keyed by `nameOrig`, so one account's transactions stay on one partition, in order.
+- The producer uses `acks=all` with idempotence enabled, so broker retries don't duplicate messages.
+- `--labels-out labels.csv` writes `transaction_id,isFraud` to a separate file, for scoring the
+  streaming predictions against ground truth later without putting the label on the wire.
+
+**Producer options:** `--start-row`, `--limit` (0 = rest of the file), `--rate` events/second
+(0 = unlimited), `--dry-run`, `--labels-out`.
+
+**`check_consumer`** reads with a throwaway consumer group from the earliest offset, so it
+never moves the offsets a real consumer depends on. It validates every message against the
+contract, checks that each key equals `nameOrig`, prints counts by type and partition, and
+exits non-zero if anything is invalid.
+
+**Verified** (Linux, 20,200 synthetic PaySim-shaped events): all valid, 0 key mismatches,
+spread evenly over the 3 partitions (6,687 / 6,776 / 6,737). Unthrottled replay delivered
+about 27,700 events/s; `--rate 100` held exactly 100 events/s. Hand-written invalid messages
+(non-JSON, and an event containing `isFraud`) were reported as invalid and the check exited 1.
+
 ## Tests
 
 ```bash
@@ -220,7 +293,10 @@ The tests build a small synthetic PaySim-shaped frame, so they run without the r
 They cover the feature formulas, column order and leak exclusion, encoder stability, the
 dataset validation errors, a chronological split with no shared steps, and an end-to-end
 training run per feature set that loads the saved artifact and checks that probabilities fall
-in [0, 1]. They also check that the `pre_transaction` set never sees post-transaction values.
+in [0, 1]. They also check that the `pre_transaction` set never sees post-transaction values, that
+events match the contract (and that invalid ones are rejected), that the producer reads
+row ranges correctly across chunk boundaries, and that streamed events can be scored by the
+`pre_transaction` model but not by `full`. None of the tests need Kafka running.
 
 ## Layout
 
@@ -231,6 +307,10 @@ src/training/features.py    validation, feature engineering, preprocessor
 src/training/inspect_data.py
 src/training/train.py       --feature-set full | pre_transaction
 src/training/compare.py     side-by-side metrics for every trained feature set
+src/common/events.py        Kafka event contract: build_event, validate_event
+src/streaming/producer.py   replay PaySim rows into the transactions topic
+src/streaming/check_consumer.py  read events back and validate them
+docker-compose.yml          Kafka, topic setup, Kafka UI
 tests/
 ```
 

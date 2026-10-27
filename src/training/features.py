@@ -53,11 +53,16 @@ def add_engineered_features(df: pd.DataFrame) -> pd.DataFrame:
 
     amount_to_balance_ratio uses only pre-transaction values. It is NaN when the
     origin balance is zero (the ratio is undefined); XGBoost treats NaN as missing.
+
+    Post-transaction features are added only when the post-transaction balances
+    are present, so live events (which omit them) still yield pre_transaction input.
     """
     out = df.copy()
     out["hour_of_day"] = out["step"] % 24
-    out["origin_balance_error"] = out["oldbalanceOrg"] - out["amount"] - out["newbalanceOrig"]
-    out["dest_balance_change"] = out["newbalanceDest"] - out["oldbalanceDest"]
+    if "newbalanceOrig" in out.columns:
+        out["origin_balance_error"] = out["oldbalanceOrg"] - out["amount"] - out["newbalanceOrig"]
+    if "newbalanceDest" in out.columns:
+        out["dest_balance_change"] = out["newbalanceDest"] - out["oldbalanceDest"]
     balance = out["oldbalanceOrg"].where(out["oldbalanceOrg"] > 0, np.nan)
     out["amount_to_balance_ratio"] = out["amount"] / balance
     return out
@@ -65,7 +70,12 @@ def add_engineered_features(df: pd.DataFrame) -> pd.DataFrame:
 
 def to_model_input(df: pd.DataFrame, feature_set: str = DEFAULT_FEATURE_SET) -> pd.DataFrame:
     """Engineer features and select them in the fixed model order."""
-    return add_engineered_features(df)[model_features(feature_set)]
+    features = model_features(feature_set)
+    engineered = add_engineered_features(df)
+    missing = [c for c in features if c not in engineered.columns]
+    if missing:
+        raise ValueError(f"Feature set {feature_set!r} needs columns that are not available: {missing}")
+    return engineered[features]
 
 
 def build_preprocessor(feature_set: str = DEFAULT_FEATURE_SET) -> ColumnTransformer:

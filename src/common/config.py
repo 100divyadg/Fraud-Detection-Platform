@@ -24,3 +24,10 @@ TRAIN_FRACTION = 0.70
 VALIDATION_FRACTION = 0.15
 
 RANDOM_STATE = 42
+
+# Kafka. localhost:9092 is the listener Docker Compose exposes to the host;
+# containers on the Compose network use kafka:29092 instead.
+KAFKA_BOOTSTRAP_SERVERS = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "localhost:9092")
+TRANSACTIONS_TOPIC = os.getenv("TRANSACTIONS_TOPIC", "transactions")
+FRAUD_ALERTS_TOPIC = os.getenv("FRAUD_ALERTS_TOPIC", "fraud-alerts")
+DEAD_LETTER_TOPIC = os.getenv("DEAD_LETTER_TOPIC", "transactions-dlq")
