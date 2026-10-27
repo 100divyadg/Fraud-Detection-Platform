@@ -10,7 +10,7 @@ This is an educational prototype trained on synthetic data. It is not production
 | Phase | Scope | State |
 |---|---|---|
 | 1 | Inspect the dataset | **Done**: `src/training/inspect_data.py` |
-| 2 | Baseline XGBoost model | **Done**: `src/training/train.py`, results below |
+| 2 | Baseline XGBoost model | **Done**: `full` vs `pre_transaction` comparison below; live pipeline uses `pre_transaction` |
 | 3 | Kafka producer / topics | Not started |
 | 4 | Spark streaming inference | Not started |
 | 5 | PostgreSQL, FastAPI, Redis | Not started |
@@ -164,8 +164,51 @@ Inference: 1.98 ms per 1,000 rows in a batch, 5.66 ms median for a single event.
 
 ### Feature-set comparison
 
-_Not yet recorded._ Paste the output of `python -m src.training.compare` here once both models
-are trained on the full dataset.
+Both models trained on the full dataset with identical splits and hyperparameters
+(`full-v20261027152251`, `pre_transaction-v20261027154648`). Retraining reproduced the same
+metrics exactly. Test set: 918,617 transactions, 4,006 of them fraud.
+
+| Model @ threshold | PR-AUC | Precision | Recall | F1 | False alarms | Missed fraud | Caught |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| `full` @ 0.5 | 0.9999 | 0.9993 | 0.9995 | 0.9994 | 3 | 2 | 4,004 |
+| `full` @ 0.9989 (validation) | 0.9999 | 1.0000 | 0.9950 | 0.9975 | 0 | 20 | 3,986 |
+| `pre_transaction` @ 0.5 | 0.9873 | 0.8837 | 0.9783 | 0.9286 | 516 | 87 | 3,919 |
+| `pre_transaction` @ 0.9980 (validation) | 0.9873 | 0.9843 | 0.8430 | 0.9082 | 54 | 629 | 3,377 |
+
+Top features by share of gain:
+
+| `full` | | `pre_transaction` | |
+|---|---:|---|---:|
+| `origin_balance_error` | 0.42 | `amount_to_balance_ratio` | 0.81 |
+| `newbalanceOrig` | 0.23 | `amount` | 0.07 |
+| `oldbalanceOrg` | 0.13 | `oldbalanceOrg` | 0.06 |
+
+**Findings**
+
+1. **The near-perfect `full` score depends on post-transaction balances.** Its two most important
+   features, `origin_balance_error` and `newbalanceOrig`, carry 65% of the gain, and both
+   require knowing the account balance after the payment.
+2. **Removing them costs a measurable amount, not everything.** At the 0.5 threshold, false
+   alarms rise from 3 to 516 and missed fraud from 2 to 87. Recall stays at 97.8% and the
+   false-positive rate is 0.056%: about 1 legitimate transaction in 1,800 is flagged.
+3. **The honest model still mostly learns PaySim's "empty the account" pattern**, now through
+   `amount_to_balance_ratio` (81% of the gain). That signal is legitimate before the payment,
+   but it is far stronger in PaySim than it would be in real fraud.
+4. **The validation-chosen threshold is again too strict for the test period.** It cuts false
+   alarms from 516 to 54 but misses 629 frauds instead of 87, because the validation window has
+   a lower fraud rate (0.058%) than the test window (0.436%).
+
+**Decision: the live pipeline uses `pre_transaction`.** It is the only model that can score a
+payment before it completes. The two thresholds map naturally onto risk levels:
+
+| Risk level | Probability | Action | Test-set effect |
+|---|---|---|---|
+| `HIGH` | >= 0.998 | Alert immediately | 3,377 frauds, 54 false alarms |
+| `MEDIUM` | 0.5 to 0.998 | Queue for analyst review | a further 542 frauds, 462 false alarms |
+| `LOW` | < 0.5 | No action | 87 frauds missed |
+
+Consequently the Kafka transaction event (Phase 3) must carry `type`, `amount`,
+`oldbalanceOrg`, `oldbalanceDest` and `step`, and does not need the post-transaction balances.
 
 ## Tests
 
