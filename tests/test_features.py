@@ -1,7 +1,14 @@
+import numpy as np
 import pandas as pd
 import pytest
 
-from src.common.schemas import EXCLUDED_COLUMNS, MODEL_FEATURES, TARGET
+from src.common.schemas import (
+    EXCLUDED_COLUMNS,
+    FEATURE_SETS,
+    POST_TRANSACTION_COLUMNS,
+    TARGET,
+    model_features,
+)
 from src.training.features import (
     add_engineered_features,
     build_preprocessor,
@@ -20,6 +27,15 @@ def test_engineered_features_match_formulas():
     assert out["hour_of_day"] == 1
     assert out["origin_balance_error"] == 50.0
     assert out["dest_balance_change"] == 100.0
+    assert out["amount_to_balance_ratio"] == pytest.approx(100 / 300)
+
+
+def test_balance_ratio_is_missing_when_origin_balance_is_zero():
+    row = pd.DataFrame(
+        [{"step": 1, "amount": 50.0, "oldbalanceOrg": 0.0, "newbalanceOrig": 0.0,
+          "oldbalanceDest": 0.0, "newbalanceDest": 50.0}]
+    )
+    assert np.isnan(add_engineered_features(row).iloc[0]["amount_to_balance_ratio"])
 
 
 def test_engineering_does_not_mutate_input(paysim_df):
@@ -28,11 +44,26 @@ def test_engineering_does_not_mutate_input(paysim_df):
     pd.testing.assert_frame_equal(paysim_df, before)
 
 
-def test_model_input_has_fixed_order_and_no_leaky_columns(paysim_df):
-    X = to_model_input(paysim_df)
-    assert X.columns.tolist() == MODEL_FEATURES
+@pytest.mark.parametrize("feature_set", sorted(FEATURE_SETS))
+def test_model_input_has_fixed_order_and_no_leaky_columns(paysim_df, feature_set):
+    X = to_model_input(paysim_df, feature_set)
+    assert X.columns.tolist() == model_features(feature_set)
     for leaky in [TARGET, "step", *EXCLUDED_COLUMNS]:
         assert leaky not in X.columns
+
+
+def test_pre_transaction_set_uses_no_post_transaction_values(paysim_df):
+    X = to_model_input(paysim_df, "pre_transaction")
+    assert not set(POST_TRANSACTION_COLUMNS) & set(X.columns)
+
+    # Changing every post-transaction balance must not change the model input.
+    shuffled = paysim_df.assign(newbalanceOrig=1.0, newbalanceDest=2.0)
+    pd.testing.assert_frame_equal(X, to_model_input(shuffled, "pre_transaction"))
+
+
+def test_unknown_feature_set_is_rejected(paysim_df):
+    with pytest.raises(ValueError, match="Unknown feature set"):
+        to_model_input(paysim_df, "everything")
 
 
 def test_preprocessor_layout_is_stable_and_handles_unseen_type(paysim_df):

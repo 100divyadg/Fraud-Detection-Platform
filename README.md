@@ -41,15 +41,20 @@ a numeric summary and sample rows.
 ## Phase 2: train the baseline
 
 ```bash
-python -m src.training.train                   # --nrows 500000 for a quick run
+python -m src.training.train                                  # full feature set
+python -m src.training.train --feature-set pre_transaction    # no post-transaction balances
+python -m src.training.compare                                # side-by-side test metrics
 ```
 
-Outputs, both git-ignored:
+Add `--nrows 500000` to either training command for a quick run.
 
-- `artifacts/fraud_model.joblib`: one sklearn `Pipeline` (preprocessing + XGBoost), so
+Outputs per feature set, all git-ignored:
+
+- `artifacts/fraud_model_<set>.joblib`: one sklearn `Pipeline` (preprocessing + XGBoost), so
   inference cannot drift from the training-time encoding.
-- `artifacts/model_metadata.json`: model version, dataset SHA-256, feature schema, chosen
-  threshold, split sizes, hyperparameters, test metrics, latency and library versions.
+- `artifacts/model_metadata_<set>.json`: model version, dataset SHA-256, feature schema, chosen
+  threshold, split sizes, hyperparameters, test metrics, feature importance (share of gain),
+  latency and library versions.
 
 ### Method
 
@@ -65,6 +70,19 @@ rule's output), `nameOrig` and `nameDest` (identifiers).
 | `hour_of_day` | `step % 24` |
 | `origin_balance_error` | `oldbalanceOrg - amount - newbalanceOrig` |
 | `dest_balance_change` | `newbalanceDest - oldbalanceDest` |
+| `amount_to_balance_ratio` | `amount / oldbalanceOrg`; missing (NaN) when the balance is 0 |
+
+**Feature sets.** Two models are trained from the same code and compared:
+
+| Set | Numeric inputs (plus `type`) | Purpose |
+|---|---|---|
+| `full` | `amount`, `oldbalanceOrg`, `newbalanceOrig`, `oldbalanceDest`, `newbalanceDest`, `hour_of_day`, `origin_balance_error`, `dest_balance_change` | Baseline using every balance column |
+| `pre_transaction` | `amount`, `oldbalanceOrg`, `oldbalanceDest`, `hour_of_day`, `amount_to_balance_ratio` | Only values known before the payment is authorised |
+
+`newbalanceOrig` and `newbalanceDest` describe the account after the transaction. A system that
+must approve or block a payment would not have them yet, so the `full` model may be using
+information from the future. The `pre_transaction` model measures how much the score depends on
+that information. A test checks that changing post-transaction balances never changes its input.
 
 Raw `step` is replaced by `hour_of_day`. `step` only increases over the simulation, so in a
 chronological split every test value lies beyond anything seen in training and the trees
@@ -109,7 +127,7 @@ accuracy is not reported.
 
 ### Baseline results (Phase 2)
 
-Full dataset, model `v20261027110747`, trained on a Windows laptop.
+`full` feature set on the full dataset, model `v20261027110747`, trained on a Windows laptop.
 
 | Split | Steps | Rows | Fraud | Fraud rate |
 |---|---|---:|---:|---:|
@@ -144,6 +162,11 @@ Inference: 1.98 ms per 1,000 rows in a batch, 5.66 ms median for a single event.
   pandas/sklearn overhead. The streaming path should score Spark micro-batches, not individual
   rows.
 
+### Feature-set comparison
+
+_Not yet recorded._ Paste the output of `python -m src.training.compare` here once both models
+are trained on the full dataset.
+
 ## Tests
 
 ```bash
@@ -153,7 +176,8 @@ pytest
 The tests build a small synthetic PaySim-shaped frame, so they run without the real dataset.
 They cover the feature formulas, column order and leak exclusion, encoder stability, the
 dataset validation errors, a chronological split with no shared steps, and an end-to-end
-training run that loads the saved artifact and checks that probabilities fall in [0, 1].
+training run per feature set that loads the saved artifact and checks that probabilities fall
+in [0, 1]. They also check that the `pre_transaction` set never sees post-transaction values.
 
 ## Layout
 
@@ -162,7 +186,8 @@ src/common/config.py        paths (env-overridable), split fractions
 src/common/schemas.py       column contract shared by training and streaming
 src/training/features.py    validation, feature engineering, preprocessor
 src/training/inspect_data.py
-src/training/train.py
+src/training/train.py       --feature-set full | pre_transaction
+src/training/compare.py     side-by-side metrics for every trained feature set
 tests/
 ```
 

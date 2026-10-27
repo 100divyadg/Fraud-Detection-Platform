@@ -8,8 +8,15 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DATA_PATH = Path(os.getenv("FRAUD_DATA_PATH", PROJECT_ROOT / "data" / "raw" / "paysim.csv"))
 ARTIFACT_DIR = Path(os.getenv("FRAUD_ARTIFACT_DIR", PROJECT_ROOT / "artifacts"))
 
-MODEL_FILENAME = "fraud_model.joblib"
-METADATA_FILENAME = "model_metadata.json"
+
+
+def model_filename(feature_set: str) -> str:
+    return f"fraud_model_{feature_set}.joblib"
+
+
+def metadata_filename(feature_set: str) -> str:
+    return f"model_metadata_{feature_set}.json"
+
 
 # Chronological split by `step`: the first 70% of rows train, the next 15%
 # choose the decision threshold, the final 15% are the untouched test set.

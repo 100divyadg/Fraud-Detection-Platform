@@ -1,10 +1,11 @@
 """Train and evaluate the baseline XGBoost fraud classifier.
 
-Usage: python -m src.training.train [--data path.csv] [--artifacts-dir dir] [--nrows N]
+Usage: python -m src.training.train [--feature-set full|pre_transaction]
+                                   [--data path.csv] [--artifacts-dir dir] [--nrows N]
 
-Writes:
-  artifacts/fraud_model.joblib   preprocessing + classifier as one sklearn Pipeline
-  artifacts/model_metadata.json  version, feature schema, threshold, metrics
+Writes, per feature set:
+  artifacts/fraud_model_<set>.joblib   preprocessing + classifier as one sklearn Pipeline
+  artifacts/model_metadata_<set>.json  version, feature schema, threshold, metrics
 """
 
 import argparse
@@ -34,19 +35,22 @@ from xgboost import XGBClassifier
 from src.common.config import (
     ARTIFACT_DIR,
     DATA_PATH,
-    METADATA_FILENAME,
-    MODEL_FILENAME,
     RANDOM_STATE,
     TRAIN_FRACTION,
     VALIDATION_FRACTION,
+    metadata_filename,
+    model_filename,
 )
 from src.common.schemas import (
     CATEGORICAL_FEATURES,
+    DEFAULT_FEATURE_SET,
     EXCLUDED_COLUMNS,
-    MODEL_FEATURES,
-    NUMERIC_FEATURES,
+    FEATURE_SETS,
+    POST_TRANSACTION_COLUMNS,
     REQUIRED_COLUMNS,
     TARGET,
+    model_features,
+    numeric_features,
 )
 from src.training.features import (
     build_preprocessor,
@@ -88,7 +92,7 @@ def chronological_split(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame, p
     return train, val, test
 
 
-def build_model(scale_pos_weight: float) -> Pipeline:
+def build_model(scale_pos_weight: float, feature_set: str = DEFAULT_FEATURE_SET) -> Pipeline:
     classifier = XGBClassifier(
         n_estimators=300,
         max_depth=6,
@@ -101,7 +105,17 @@ def build_model(scale_pos_weight: float) -> Pipeline:
         random_state=RANDOM_STATE,
         n_jobs=-1,
     )
-    return Pipeline([("preprocess", build_preprocessor()), ("classifier", classifier)])
+    return Pipeline([("preprocess", build_preprocessor(feature_set)), ("classifier", classifier)])
+
+
+def feature_importance(model: Pipeline) -> dict[str, float]:
+    """Share of total gain per encoded feature, largest first."""
+    names = model.named_steps["preprocess"].get_feature_names_out()
+    gain = model.named_steps["classifier"].get_booster().get_score(importance_type="total_gain")
+    # The booster names features f0, f1, ... in preprocessor output order.
+    by_name = {name: gain.get(f"f{i}", 0.0) for i, name in enumerate(names)}
+    total = sum(by_name.values()) or 1.0
+    return {k: round(v / total, 4) for k, v in sorted(by_name.items(), key=lambda kv: -kv[1])}
 
 
 def select_threshold(y_true: pd.Series, proba: np.ndarray) -> float:
@@ -151,7 +165,14 @@ def print_metrics(title: str, m: dict) -> None:
     print(f"  confusion matrix: TN={cm['tn']:,}  FP={cm['fp']:,}  FN={cm['fn']:,}  TP={cm['tp']:,}")
 
 
-def train(data_path: Path, artifact_dir: Path, nrows: int | None = None) -> dict:
+def train(
+    data_path: Path,
+    artifact_dir: Path,
+    nrows: int | None = None,
+    feature_set: str = DEFAULT_FEATURE_SET,
+) -> dict:
+    features = model_features(feature_set)
+    print(f"Feature set: {feature_set} -> {features}")
     print(f"Loading {data_path}")
     df = load_dataset(data_path, nrows)
     train_df, val_df, test_df = chronological_split(df)
@@ -162,13 +183,13 @@ def train(data_path: Path, artifact_dir: Path, nrows: int | None = None) -> dict
         "test": describe_split("test", test_df),
     }
 
-    X_train, y_train = to_model_input(train_df), train_df[TARGET]
-    X_val, y_val = to_model_input(val_df), val_df[TARGET]
-    X_test, y_test = to_model_input(test_df), test_df[TARGET]
+    X_train, y_train = to_model_input(train_df, feature_set), train_df[TARGET]
+    X_val, y_val = to_model_input(val_df, feature_set), val_df[TARGET]
+    X_test, y_test = to_model_input(test_df, feature_set), test_df[TARGET]
 
     negatives, positives = int((y_train == 0).sum()), int((y_train == 1).sum())
     scale_pos_weight = negatives / positives
-    model = build_model(scale_pos_weight)
+    model = build_model(scale_pos_weight, feature_set)
 
     print(f"\nTraining XGBoost on {len(X_train):,} rows (scale_pos_weight={scale_pos_weight:.1f})")
     started = time.perf_counter()
@@ -210,9 +231,15 @@ def train(data_path: Path, artifact_dir: Path, nrows: int | None = None) -> dict
         f"{latency['single_event_ms_median']:.3f} ms median per single event"
     )
 
+    importance = feature_importance(model)
+    print("\nFeature importance (share of total gain):")
+    for name, share in list(importance.items())[:8]:
+        print(f"  {name:<26} {share:.4f}")
+
     trained_at = datetime.now(timezone.utc)
     metadata = {
-        "model_version": trained_at.strftime("v%Y%m%d%H%M%S"),
+        "model_version": f"{feature_set}-" + trained_at.strftime("v%Y%m%d%H%M%S"),
+        "feature_set": feature_set,
         "trained_at": trained_at.isoformat(),
         "dataset": {
             "file": data_path.name,
@@ -222,8 +249,9 @@ def train(data_path: Path, artifact_dir: Path, nrows: int | None = None) -> dict
         },
         "target": TARGET,
         "feature_schema": {
-            "model_features": MODEL_FEATURES,
-            "numeric_features": NUMERIC_FEATURES,
+            "model_features": features,
+            "numeric_features": numeric_features(feature_set),
+            "uses_post_transaction_columns": [c for c in features if c in POST_TRANSACTION_COLUMNS],
             "categorical_features": CATEGORICAL_FEATURES,
             "excluded_columns": EXCLUDED_COLUMNS,
             "encoded_features": model.named_steps["preprocess"].get_feature_names_out().tolist(),
@@ -237,6 +265,7 @@ def train(data_path: Path, artifact_dir: Path, nrows: int | None = None) -> dict
             if k in ("n_estimators", "max_depth", "learning_rate", "subsample", "colsample_bytree", "scale_pos_weight")
         },
         "test_metrics": test_metrics,
+        "feature_importance_gain": importance,
         "latency": latency,
         "library_versions": {
             "xgboost": xgboost.__version__,
@@ -246,19 +275,26 @@ def train(data_path: Path, artifact_dir: Path, nrows: int | None = None) -> dict
     }
 
     artifact_dir.mkdir(parents=True, exist_ok=True)
-    joblib.dump(model, artifact_dir / MODEL_FILENAME)
-    (artifact_dir / METADATA_FILENAME).write_text(json.dumps(metadata, indent=2))
-    print(f"\nSaved {artifact_dir / MODEL_FILENAME} and {METADATA_FILENAME} ({metadata['model_version']})")
+    model_path = artifact_dir / model_filename(feature_set)
+    joblib.dump(model, model_path)
+    (artifact_dir / metadata_filename(feature_set)).write_text(json.dumps(metadata, indent=2))
+    print(f"\nSaved {model_path} and {metadata_filename(feature_set)} ({metadata['model_version']})")
     return metadata
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument(
+        "--feature-set",
+        choices=sorted(FEATURE_SETS),
+        default=DEFAULT_FEATURE_SET,
+        help="full: all balance columns; pre_transaction: only values known before the payment",
+    )
     parser.add_argument("--data", type=Path, default=DATA_PATH, help="Path to the PaySim CSV")
     parser.add_argument("--artifacts-dir", type=Path, default=ARTIFACT_DIR, help="Where to write the model")
     parser.add_argument("--nrows", type=int, default=None, help="Read only the first N rows (quick experiments)")
     args = parser.parse_args()
-    train(args.data, args.artifacts_dir, args.nrows)
+    train(args.data, args.artifacts_dir, args.nrows, args.feature_set)
 
 
 if __name__ == "__main__":

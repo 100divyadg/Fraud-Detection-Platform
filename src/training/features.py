@@ -4,6 +4,7 @@ Everything here must be computable from a single transaction event at the
 moment it arrives, so the streaming path can call the same functions.
 """
 
+import numpy as np
 import pandas as pd
 from sklearn.compose import ColumnTransformer
 from sklearn.preprocessing import OneHotEncoder
@@ -11,11 +12,12 @@ from sklearn.preprocessing import OneHotEncoder
 from src.common.schemas import (
     CATEGORICAL_FEATURES,
     COLUMN_ALIASES,
-    MODEL_FEATURES,
-    NUMERIC_FEATURES,
+    DEFAULT_FEATURE_SET,
     REQUIRED_COLUMNS,
     TARGET,
     TRANSACTION_TYPES,
+    model_features,
+    numeric_features,
 )
 
 
@@ -48,26 +50,31 @@ def add_engineered_features(df: pd.DataFrame) -> pd.DataFrame:
     hour_of_day replaces raw `step`: step only grows over the simulation, so a
     chronological test set would contain values the model never saw. The hour
     keeps the daily cycle without that extrapolation problem.
+
+    amount_to_balance_ratio uses only pre-transaction values. It is NaN when the
+    origin balance is zero (the ratio is undefined); XGBoost treats NaN as missing.
     """
     out = df.copy()
     out["hour_of_day"] = out["step"] % 24
     out["origin_balance_error"] = out["oldbalanceOrg"] - out["amount"] - out["newbalanceOrig"]
     out["dest_balance_change"] = out["newbalanceDest"] - out["oldbalanceDest"]
+    balance = out["oldbalanceOrg"].where(out["oldbalanceOrg"] > 0, np.nan)
+    out["amount_to_balance_ratio"] = out["amount"] / balance
     return out
 
 
-def to_model_input(df: pd.DataFrame) -> pd.DataFrame:
+def to_model_input(df: pd.DataFrame, feature_set: str = DEFAULT_FEATURE_SET) -> pd.DataFrame:
     """Engineer features and select them in the fixed model order."""
-    return add_engineered_features(df)[MODEL_FEATURES]
+    return add_engineered_features(df)[model_features(feature_set)]
 
 
-def build_preprocessor() -> ColumnTransformer:
+def build_preprocessor(feature_set: str = DEFAULT_FEATURE_SET) -> ColumnTransformer:
     # Fixed categories keep the encoded layout identical across retrains;
     # an unseen type at inference time encodes to all zeros instead of crashing.
     encoder = OneHotEncoder(categories=[TRANSACTION_TYPES], handle_unknown="ignore", sparse_output=False)
     return ColumnTransformer(
         [
-            ("numeric", "passthrough", NUMERIC_FEATURES),
+            ("numeric", "passthrough", numeric_features(feature_set)),
             ("type", encoder, CATEGORICAL_FEATURES),
         ],
         verbose_feature_names_out=False,
